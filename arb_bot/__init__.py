@@ -1,1 +1,1 @@
-"""Arb bot package."""
+"""Utility helpers (logging, alerts)."""
