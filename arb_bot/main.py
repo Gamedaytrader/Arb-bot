@@ -1,13 +1,25 @@
-from arb_bot.engine.sizing import balanced_sizes, has_two_sided_edge
+import itertools
+import logging
+import time
+
+from arb_bot.config import (
+    DRY_RUN,
+    MATCH_THRESHOLD,
+    MAX_BET_SIZE,
+    MIN_EDGE,
+    MIN_LIQUIDITY_USD,
+    POLL_INTERVAL,
+)
+from arb_bot.engine.sizing import balanced_sizes
 from arb_bot.fetchers import kalshi, novig, polymarket
 from arb_bot.matching.event_matcher import MarketPair, find_matches
 from arb_bot.models import RawMarket
-from arb_bot.utils.discord import send_arb_alert, send_error_alert
-from arb_bot.utils.logger import setup_logging
- 
+from arb_bot.Utils.discord import send_arb_alert, send_error_alert
+from arb_bot.Utils.logger import setup_logging
+
 logger = logging.getLogger(__name__)
- 
- 
+
+
 def fetch_all_markets() -> dict[str, list[RawMarket]]:
     """Fetch markets from all platforms, returning per-platform lists."""
     results: dict[str, list[RawMarket]] = {}
@@ -23,20 +35,20 @@ def fetch_all_markets() -> dict[str, list[RawMarket]]:
             logger.error("Failed to fetch %s markets: %s", name, exc)
             results[name] = []
     return results
- 
- 
-def evaluate_pair(pair: MarketPair) -> None:
+
+
+def evaluate_pair(pair: MarketPair) -> int:
     """
     Check a matched market pair for arbitrage.
- 
-    Uses the best-ask prices from the market list (no orderbook call needed
-    for detection).  Logs and alerts if an opportunity is found.
+
+    Returns number of opportunities found in the two directions (0, 1, or 2).
     """
     a = pair.market_a
     b = pair.market_b
- 
-    # --- Check A-YES / B-NO direction ---
-    _check_direction(
+    found = 0
+
+    # A-YES / B-NO
+    if _check_direction(
         yes_market=a,
         no_market=b,
         yes_price=a.yes_ask,
@@ -44,10 +56,11 @@ def evaluate_pair(pair: MarketPair) -> None:
         yes_liq=a.yes_liquidity,
         no_liq=b.no_liquidity,
         match_score=pair.match_score,
-    )
- 
-    # --- Check B-YES / A-NO direction ---
-    _check_direction(
+    ):
+        found += 1
+
+    # B-YES / A-NO
+    if _check_direction(
         yes_market=b,
         no_market=a,
         yes_price=b.yes_ask,
@@ -55,9 +68,12 @@ def evaluate_pair(pair: MarketPair) -> None:
         yes_liq=b.yes_liquidity,
         no_liq=a.no_liquidity,
         match_score=pair.match_score,
-    )
- 
- 
+    ):
+        found += 1
+
+    return found
+
+
 def _check_direction(
     yes_market: RawMarket,
     no_market: RawMarket,
@@ -66,11 +82,11 @@ def _check_direction(
     yes_liq: float,
     no_liq: float,
     match_score: float,
-) -> None:
+) -> bool:
     edge = 1.0 - yes_price - no_price
     if edge < MIN_EDGE:
-        return
- 
+        return False
+
     min_liq = min(yes_liq, no_liq)
     if min_liq < MIN_LIQUIDITY_USD and min_liq > 0:
         logger.debug(
@@ -80,29 +96,28 @@ def _check_direction(
             edge * 100,
             min_liq,
         )
-        return
- 
+        return False
+
     # Cap bet size to MAX_BET_SIZE and 30% of available liquidity
-    max_from_liq = min(yes_liq, no_liq) * 0.3 if min_liq > 0 else MAX_BET_SIZE
+    max_from_liq = min_liq * 0.3 if min_liq > 0 else MAX_BET_SIZE
     max_bet = min(MAX_BET_SIZE, max_from_liq)
     if max_bet <= 0:
-        max_bet = MAX_BET_SIZE  # fallback when liquidity unknown
- 
+        max_bet = MAX_BET_SIZE
+
     sizing = balanced_sizes(
         yes_price=yes_price,
         no_price=no_price,
         max_yes_size=max_bet,
         max_no_size=max_bet,
     )
- 
+
     if sizing.profit_if_yes <= 0 or sizing.profit_if_no <= 0:
-        return
- 
+        return False
+
     expected_profit = min(sizing.profit_if_yes, sizing.profit_if_no)
- 
+
     logger.info(
-        "ARB FOUND  edge=%.1f%%  %s YES@%.3f / %s NO@%.3f  "
-        "bet=$%.2f  profit=$%.2f  match=%.0f%%  title='%s'",
+        "ARB FOUND edge=%.1f%% %s YES@%.3f / %s NO@%.3f bet=$%.2f profit=$%.2f match=%.0f%% title='%s'",
         edge * 100,
         yes_market.platform,
         yes_price,
@@ -113,23 +128,23 @@ def _check_direction(
         match_score,
         yes_market.title,
     )
- 
+
     if DRY_RUN:
         logger.info(
-            "[DRY RUN] Would BUY YES on %s market_id=%s @ %.3f  size=$%.2f",
+            "[DRY RUN] Would BUY YES on %s market_id=%s @ %.3f size=$%.2f",
             yes_market.platform,
             yes_market.market_id,
             yes_price,
             max_bet,
         )
         logger.info(
-            "[DRY RUN] Would BUY NO  on %s market_id=%s @ %.3f  size=$%.2f",
+            "[DRY RUN] Would BUY NO on %s market_id=%s @ %.3f size=$%.2f",
             no_market.platform,
             no_market.market_id,
             no_price,
             max_bet,
         )
- 
+
     send_arb_alert(
         yes_market=yes_market,
         no_market=no_market,
@@ -138,13 +153,14 @@ def _check_direction(
         expected_profit=expected_profit,
         dry_run=DRY_RUN,
     )
- 
- 
+    return True
+
+
 def run_cycle() -> None:
     """Execute one full scan cycle."""
     start = time.monotonic()
     logger.info("--- Scan cycle starting ---")
- 
+
     all_markets = fetch_all_markets()
     total = sum(len(v) for v in all_markets.values())
     logger.info(
@@ -154,12 +170,11 @@ def run_cycle() -> None:
         len(all_markets.get("novig", [])),
         len(all_markets.get("polymarket", [])),
     )
- 
-    # Cross-match every platform pair
+
     platform_names = [p for p, mlist in all_markets.items() if mlist]
     pairs_checked = 0
     opps_found = 0
- 
+
     for p1, p2 in itertools.combinations(platform_names, 2):
         matches = find_matches(
             all_markets[p1],
@@ -169,24 +184,28 @@ def run_cycle() -> None:
         logger.info("Matched %d pairs: %s <-> %s", len(matches), p1, p2)
         for pair in matches:
             pairs_checked += 1
-            evaluate_pair(pair)
- 
+            opps_found += evaluate_pair(pair)
+
     elapsed = time.monotonic() - start
     logger.info(
-        "--- Cycle done in %.1fs  pairs_checked=%d ---",
+        "--- Cycle done in %.1fs pairs_checked=%d opportunities=%d ---",
         elapsed,
         pairs_checked,
+        opps_found,
     )
+
+
+def main() -> None:
     setup_logging()
     logger.info(
-        "Arb bot starting  DRY_RUN=%s  MIN_EDGE=%.1f%%  POLL_INTERVAL=%ds",
+        "Arb bot starting DRY_RUN=%s MIN_EDGE=%.1f%% POLL_INTERVAL=%ds",
         DRY_RUN,
         MIN_EDGE * 100,
         POLL_INTERVAL,
     )
     if DRY_RUN:
         logger.info("Running in DRY RUN mode — no live orders will be placed")
- 
+
     while True:
         try:
             run_cycle()
@@ -199,9 +218,9 @@ def run_cycle() -> None:
                 send_error_alert(str(exc))
             except Exception:
                 pass
- 
+
         time.sleep(POLL_INTERVAL)
- 
- 
+
+
 if __name__ == "__main__":
     main()
