@@ -14,8 +14,8 @@ from arb_bot.engine.sizing import balanced_sizes
 from arb_bot.fetchers import kalshi, novig, polymarket
 from arb_bot.matching.event_matcher import MarketPair, find_matches
 from arb_bot.models import RawMarket
-from arb_bot.Utils.discord import send_arb_alert, send_error_alert
-from arb_bot.Utils.logger import setup_logging
+from arb_bot.utils.discord import send_arb_alert, send_error_alert
+from arb_bot.utils.logger import setup_logging
 
 logger = logging.getLogger(__name__)
 
